@@ -1,5 +1,5 @@
 """
-One-time data preparation for autoresearch experiments.
+One-time data preparation for autoresearch experiments (MLX version).
 Downloads data shards and trains a BPE tokenizer.
 
 Usage:
@@ -17,11 +17,12 @@ import argparse
 import pickle
 from multiprocessing import Pool
 
+import numpy as np
 import requests
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
-import torch
+import mlx.core as mx
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
@@ -29,7 +30,7 @@ import torch
 
 MAX_SEQ_LEN = 2048       # context length
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+EVAL_TOKENS = 3 * 524288 # number of tokens for val eval (reduced for Apple Silicon)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -96,7 +97,6 @@ def download_data(num_shards, download_workers=8):
     if VAL_SHARD not in ids:
         ids.append(VAL_SHARD)
 
-    # Count what's already downloaded
     existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
     if existing == len(ids):
         print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
@@ -141,7 +141,7 @@ def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
 def train_tokenizer():
     """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
     tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
 
     if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
         print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
@@ -154,7 +154,6 @@ def train_tokenizer():
         print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
         sys.exit(1)
 
-    # --- Train with rustbpe ---
     print("Tokenizer: training BPE tokenizer...")
     t0 = time.time()
 
@@ -162,7 +161,6 @@ def train_tokenizer():
     vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
     tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
 
-    # Build tiktoken encoding from trained merges
     pattern = tokenizer.get_pattern()
     mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
     tokens_offset = len(mergeable_ranks)
@@ -174,14 +172,13 @@ def train_tokenizer():
         special_tokens=special_tokens,
     )
 
-    # Save tokenizer
     with open(tokenizer_pkl, "wb") as f:
         pickle.dump(enc, f)
 
     t1 = time.time()
     print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
 
-    # --- Build token_bytes lookup for BPB evaluation ---
+    # Build token_bytes lookup for BPB evaluation
     print("Tokenizer: building token_bytes lookup...")
     special_set = set(SPECIAL_TOKENS)
     token_bytes_list = []
@@ -191,8 +188,8 @@ def train_tokenizer():
             token_bytes_list.append(0)
         else:
             token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
+    token_bytes_arr = np.array(token_bytes_list, dtype=np.int32)
+    np.save(token_bytes_path, token_bytes_arr)
     print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
 
     # Sanity check
@@ -245,10 +242,12 @@ class Tokenizer:
         return self.enc.decode(ids)
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def get_token_bytes():
+    """Load token_bytes lookup as an mx.array."""
+    path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing token_bytes lookup at {path}. Run prepare.py first.")
+    return mx.array(np.load(path), dtype=mx.int32)
 
 
 def _document_batches(split, tokenizer_batch_size=128):
@@ -279,6 +278,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
     When no document fits remaining space, crops shortest doc to fill exactly.
     100% utilization (no padding).
+
+    Returns mx.array batches directly (unified memory — no CPU/GPU transfer needed).
     """
     assert split in ["train", "val"]
     row_capacity = T + 1
@@ -293,17 +294,10 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
     while True:
-        for row_idx in range(B):
+        all_rows = []
+        for _ in range(B):
+            row = []
             pos = 0
             while pos < row_capacity:
                 while len(doc_buffer) < buffer_size:
@@ -322,25 +316,27 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
                 if best_idx >= 0:
                     doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
+                    row.extend(doc)
                     pos += len(doc)
                 else:
                     # No doc fits — crop shortest to fill remaining
                     shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    row.extend(doc[:remaining])
                     pos += remaining
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+            all_rows.append(row[:row_capacity])
+
+        # Convert to mx.array — unified memory, no transfers needed
+        row_array = mx.array(all_rows, dtype=mx.int32)
+        inputs = row_array[:, :-1]
+        targets = row_array[:, 1:]
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
 def evaluate_bpb(model, tokenizer, batch_size):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
@@ -349,19 +345,23 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    token_bytes = get_token_bytes()
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
+
     for _ in range(steps):
         x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
+        loss_flat = model(x, y, reduction='none').reshape(-1)
+        y_flat = y.reshape(-1)
+        nbytes = mx.take(token_bytes, y_flat, axis=0)
         mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
+        total_nats += mx.sum(loss_flat * mask).item()
+        total_bytes += int(mx.sum(nbytes).item())
+
+    if total_bytes == 0:
+        return float("inf")
     return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------
@@ -369,7 +369,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
+    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch (MLX)")
     parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
     args = parser.parse_args()

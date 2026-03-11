@@ -14,30 +14,31 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 
 # 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare_mlx.py
+uv run prepare.py
 
 # 4. Run a single training experiment (~5 min)
-uv run train_mlx.py
+uv run train.py
 
 # 4b. Or run with a custom time budget (e.g. 10 minutes)
-uv run train_mlx.py --time-budget 600
+uv run train.py --time-budget 600
 ```
 
 ## Project structure
 
 ```
-prepare_mlx.py  — constants, data prep + runtime utilities (MLX/Apple Silicon)
-train_mlx.py    — model, optimizer, training loop (MLX/Apple Silicon)
-prepare.py      — constants, data prep + runtime utilities (CUDA, do not modify)
-train.py        — model, optimizer, training loop (CUDA, agent modifies this)
+prepare.py      — constants, data prep + runtime utilities (MLX, do not modify)
+train.py        — model, optimizer, training loop (MLX, agent modifies this)
 program.md      — agent instructions
 pyproject.toml  — dependencies
+train.py.bak    — original CUDA training script (backup)
+prepare.py.bak  — original CUDA data pipeline (backup)
 ```
 
-## MLX-specific files
+## Files
 
-- `prepare_mlx.py` — data prep + evaluation (MLX arrays, unified memory dataloader)
-- `train_mlx.py` — model + optimizer + training loop (MLX native)
+- `prepare.py` — data prep + evaluation (MLX arrays, unified memory dataloader)
+- `train.py` — model + optimizer + training loop (MLX native, agent modifies this)
+- `train.py.bak` / `prepare.py.bak` — original CUDA versions (backup, not used)
 
 **Key differences from CUDA version:**
 - Uses AdamW only (no Muon optimizer — future work)
@@ -50,9 +51,9 @@ pyproject.toml  — dependencies
 
 **Tunable time budget:** The default training budget is 5 minutes (300s). Use `--time-budget` to increase it:
 ```bash
-uv run train_mlx.py --time-budget 600   # 10 minutes
-uv run train_mlx.py --time-budget 1800  # 30 minutes
-uv run train_mlx.py --time-budget 3600  # 1 hour
+uv run train.py --time-budget 600   # 10 minutes
+uv run train.py --time-budget 1800  # 30 minutes
+uv run train.py --time-budget 3600  # 1 hour
 ```
 Longer budgets allow more optimizer steps and significantly better BPB. On Apple Silicon, 10-30 minutes is a good starting point for meaningful results.
 
@@ -131,7 +132,7 @@ The BPB difference vs the reference's 1.808 is primarily **hardware-limited**: t
 
 ## Running the agent (MLX)
 
-To run the agent autonomously on MLX, point it at `program_mlx.md` (if available) or `program.md` with `train_mlx.py` as the target file.
+To run the agent autonomously on MLX, point it at `program.md` with `train.py` as the target file.
 
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
 

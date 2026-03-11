@@ -22,5 +22,8 @@ dev/
 # Results file
 results.tsv
 
+# Backup files (original CUDA versions)
+*.bak
+
 # Reference implementations (third-party, read-only)
 reference/
