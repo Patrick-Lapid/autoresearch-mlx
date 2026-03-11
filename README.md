@@ -151,7 +151,7 @@ If you use this software in your research, please cite it:
   author = {Goyal, Naman},
   title = {autoresearch-mlx: Apple Silicon MLX Port of Autoresearch},
   year = {2026},
-  url = {https://github.com/namangoyal/autoresearch},
+  url = {https://github.com/thenamangoyal/autoresearch},
   license = {MIT}
 }
 ```
