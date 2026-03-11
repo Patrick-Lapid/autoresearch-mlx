@@ -156,6 +156,18 @@ If you use this software in your research, please cite it:
 }
 ```
 
+For the blog post:
+
+```bibtex
+@article{goyal2026your-macbook-can-do-autonomous-ai-research-now,
+  title   = {Your MacBook Can Do Autonomous AI Research Now},
+  author  = {Goyal, Naman},
+  year    = {2026},
+  month   = {Mar},
+  url     = {https://namangoyal.com/blog/2026/autoresearch-mlx/}
+}
+```
+
 The original autoresearch project by [Andrej Karpathy](https://github.com/karpathy/autoresearch):
 
 ```bibtex
