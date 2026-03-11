@@ -331,6 +331,7 @@ class AdamW:
                 }
 
         self.initial_lrs = {path: cfg["lr"] for path, cfg in self.param_config.items()}
+        self.initial_weight_decays = {path: cfg["weight_decay"] for path, cfg in self.param_config.items()}
 
     def _set_path_value(self, model, path, value):
         """Set a parameter value at a dotted path in the model tree."""
@@ -392,6 +393,10 @@ class AdamW:
     def set_lr_multiplier(self, multiplier):
         for path, config in self.param_config.items():
             config["lr"] = self.initial_lrs[path] * multiplier
+
+    def set_weight_decay_multiplier(self, multiplier):
+        for path, config in self.param_config.items():
+            config["weight_decay"] = self.initial_weight_decays[path] * multiplier
 
     @property
     def state(self):
@@ -537,6 +542,7 @@ if __name__ == "__main__":
         progress = min(total_training_time / TIME_BUDGET, 1.0)
         lrm = get_lr_multiplier(progress)
         optimizer.set_lr_multiplier(lrm)
+        optimizer.set_weight_decay_multiplier(1.0 - progress)
         optimizer.update(model, accum_grads)
         mx.eval(model.parameters(), *optimizer.state)
 
@@ -582,24 +588,36 @@ if __name__ == "__main__":
 
     print()  # newline after \r training log
 
+    t_train = time.time()
+    print(f"Training completed in {t_train - (t_compiled or t_data):.1f}s")
+
     total_tokens = step * TOTAL_BATCH_SIZE
 
     # Final eval
     print("Starting final eval...")
     print(f"Final eval batch size: {FINAL_EVAL_BATCH_SIZE}")
     val_bpb = evaluate_bpb(model, tokenizer, FINAL_EVAL_BATCH_SIZE)
+    t_eval = time.time()
+    print(f"Final eval completed in {t_eval - t_train:.1f}s")
+
+    # MFU calculation
+    peak_flops_tflops = float(os.environ.get("PEAK_FLOPS_TFLOPS", "0"))
+    if peak_flops_tflops > 0 and total_training_time > 0:
+        warmup_steps = STARTUP_EXCLUDE_STEPS
+        steady_steps = step - warmup_steps
+        steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * steady_steps / total_training_time / (peak_flops_tflops * 1e12)
+    else:
+        steady_state_mfu = 0.0
 
     # Final summary
-    t_end = time.time()
-    startup_time = (t_compiled or t_data) - t_start
     peak_vram_mb = get_peak_memory_mb()
 
     print("---")
     print(f"val_bpb:          {val_bpb:.6f}")
     print(f"training_seconds: {total_training_time:.1f}")
-    print(f"total_seconds:    {t_end - t_start:.1f}")
+    print(f"total_seconds:    {t_eval - t_start:.1f}")
     print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-    print(f"mfu_percent:      0.00")
+    print(f"mfu_percent:      {steady_state_mfu:.2f}")
     print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
     print(f"num_steps:        {step}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")
