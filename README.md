@@ -2,6 +2,8 @@
 
 Apple Silicon MLX port of [karpathy/autoresearch](https://github.com/karpathy/autoresearch) for running autonomous AI pretraining research natively on M-series Macs. Uses [Apple MLX](https://github.com/ml-explore/mlx) instead of PyTorch/CUDA, taking advantage of unified memory (no CPU/GPU transfers).
 
+**Blog post:** [Your MacBook Can Do Autonomous AI Research Now](https://namangoyal.com/blog/2026/autoresearch-mlx/) — architecture deep dive, real benchmarks, and a full guide.
+
 ## Quick start (Apple Silicon)
 
 **Requirements:** Apple M-series Mac (M1/M2/M3/M4), Python 3.10+, [uv](https://docs.astral.sh/uv/).
