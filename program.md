@@ -12,9 +12,9 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
+   - `schema.py` — ExperimentRecord schema for dashboard integration. Read-only.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+5. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
@@ -27,6 +27,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
+- Modify `schema.py`. It is read-only. It defines the experiment record format.
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
 
@@ -55,77 +56,116 @@ num_params_M:     50.3
 depth:            8
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
-
-```
-grep "^val_bpb:" run.log
-```
-
-## Logging results
-
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpb	memory_gb	status	description
-```
-
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
-
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
-```
+Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different.
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+The experiment runs on a dedicated branch (e.g. `autoresearch/mar5`).
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
+1. Look at the git state: the current branch/commit we're on.
 2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+3. `git commit` the change with a short descriptive message.
+4. Record the parent commit: `PARENT=$(git rev-parse --short HEAD~1)`.
+5. Run the experiment: `uv run train.py --time-budget <budget> > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context).
+6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:\|^training_seconds:\|^total_seconds:\|^mfu_percent:\|^total_tokens_M:\|^num_steps:\|^num_params_M:\|^depth:" run.log`
+7. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
+8. **Record the experiment** (see "Recording experiments" below).
+9. If val_bpb improved (lower), you "advance" the branch, keeping the git commit.
+10. If val_bpb is equal or worse, you `git reset --hard HEAD~1` to discard the commit.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
 **Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status, and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+## Recording experiments (dashboard integration)
 
-## Observability instrumentation (do not skip)
+After every run (success or crash), record an `ExperimentRecord` to `experiments.jsonl`.
+This file is the single source of truth for the dashboard — it reads this file and
+renders the interactive experiment graph.
 
-Before modifying train.py for each experiment, write a reasoning block to
-`reasoning.jsonl` in the repo root. Format is one JSON object per line:
+Use `schema.py` to create and append the record:
 
-    {"type":"agent_note","run_id":"<run_id from env>","intent":"<what you plan to change>","hypothesis":"<why you expect it to improve BPB>"}
+```python
+from schema import ExperimentRecord, dump_record, git_short_hash, git_diff_stat, git_diff_hash, utc_now, next_id, current_best
 
-The run_id for the current experiment is available in the CURRENT_RUN_ID
-environment variable set by run.sh.
+# After parsing run.log output:
+best = current_best("experiments.jsonl")
+status = "keep" if val_bpb < best else "discard"  # or "crash" if it crashed
+delta = val_bpb - best if best != float("inf") else 0.0
 
-After train.py finishes and you have decided whether to keep or discard:
+record = ExperimentRecord(
+    id=next_id("experiments.jsonl"),
+    commit=git_short_hash(),
+    parent_commit=parent_commit,       # from git rev-parse --short HEAD~1 (before reset)
+    timestamp=utc_now(),
+    status=status,
+    description="what you tried",
 
-    {"type":"accept_decision","run_id":"<run_id>","accepted":true,"reason":"<brief>"}
+    val_bpb=val_bpb,
+    delta=delta,
 
-Write this to reasoning.jsonl immediately after your decision. The server
-tails reasoning.jsonl and forwards both event types to the dashboard.
+    train_bpb=train_bpb,               # final training loss (if available, else val_bpb)
+    bpb_at_checkpoints=[],             # val_bpb at 25/50/75/100% (if available, else [])
+    still_improving=False,              # was loss still dropping at end?
+    improvement_rate=0.0,               # bpb/step in last 25%
+
+    num_steps=num_steps,
+    tokens_per_second=tok_per_sec,
+    training_seconds=training_seconds,
+    total_seconds=total_seconds,
+    mfu_percent=mfu_percent,
+    total_tokens_M=total_tokens_m,
+
+    peak_vram_gb=peak_vram_mb / 1024,
+    gpu_name="Apple Silicon",          # or read from system
+
+    num_params_M=num_params_m,
+    depth=depth,
+    model_dim=depth * 64,              # from ASPECT_RATIO
+    n_heads=depth * 64 // 128,         # from HEAD_DIM
+    head_dim=128,
+    window_pattern=window_pattern,
+
+    total_batch_size=total_batch_size,
+    device_batch_size=device_batch_size,
+    matrix_lr=matrix_lr,
+    embedding_lr=embedding_lr,
+    weight_decay=weight_decay,
+    warmdown_ratio=warmdown_ratio,
+    adam_betas=adam_betas,
+
+    diff_stat=git_diff_stat(),
+    diff_hash=git_diff_hash(),
+)
+dump_record(record, "experiments.jsonl")
+```
+
+**Key rules:**
+- Write the record BEFORE doing `git reset` (on discard), so the commit hash is still valid.
+- The `parent_commit` field is what links experiments into a tree in the dashboard.
+- The `description` field should be a concise summary of what you changed and why.
+- For crashes, set `val_bpb=0.0`, `delta=0.0`, and fill what you can. Use status `"crash"`.
+- `experiments.jsonl` should NOT be git-committed — leave it untracked.
+
+## The dashboard
+
+The dashboard server reads `experiments.jsonl` and renders an interactive experiment graph.
+Start it with: `uv run uvicorn dashboard.server:app --host 0.0.0.0 --port 8000`
+
+It provides:
+- **Live page** (`/`): Shows the latest experiment with metrics and convergence data.
+- **Decisions page** (`/history`): Interactive node graph where each experiment is a node.
+  - Nodes positioned by (experiment id, val_bpb). Green = kept, red = discarded, amber = crash.
+  - Edges show parent→child lineage via commit hashes.
+  - Hover for tooltip with description, param changes, delta.
+  - Click for full detail card with convergence checkpoints, diff, and metrics.
+  - Insight sidebar with keep rate, strategy hit rates, breakthrough velocity.
+- **SSE streaming**: New experiments appear in real time as they're appended to experiments.jsonl.
+
+The dashboard is **harness-agnostic** — it only reads `experiments.jsonl`. Any tool or agent that writes valid `ExperimentRecord` JSON lines will work.
