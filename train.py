@@ -21,6 +21,15 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
+try:
+    from dashboard.tracker import start_run, log_step, end_run
+    _TRACKING = True
+except ImportError:
+    _TRACKING = False
+    def start_run(*a, **kw): return None
+    def log_step(*a, **kw): pass
+    def end_run(*a, **kw): pass
+
 # ---------------------------------------------------------------------------
 # GPT Model
 # ---------------------------------------------------------------------------
@@ -422,7 +431,7 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 TOTAL_BATCH_SIZE = 2**16 # ~65K tokens per optimizer step (reduced for Apple Silicon)
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Adam)
+MATRIX_LR = 0.02        # learning rate for matrix parameters (Adam)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # weight decay for matrix params
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
@@ -514,6 +523,26 @@ if __name__ == "__main__":
 
     loss_grad_fn = nn.value_and_grad(model, lambda mdl, inp, tgt: mdl(inp, targets=tgt))
 
+    _config_snapshot = {
+        "depth": DEPTH,
+        "total_batch_size": TOTAL_BATCH_SIZE,
+        "device_batch_size": DEVICE_BATCH_SIZE,
+        "embedding_lr": EMBEDDING_LR,
+        "unembedding_lr": UNEMBEDDING_LR,
+        "matrix_lr": MATRIX_LR,
+        "scalar_lr": SCALAR_LR,
+        "weight_decay": WEIGHT_DECAY,
+        "warmup_ratio": WARMUP_RATIO,
+        "warmdown_ratio": WARMDOWN_RATIO,
+        "final_lr_frac": FINAL_LR_FRAC,
+        "adam_betas": list(ADAM_BETAS),
+        "window_pattern": WINDOW_PATTERN,
+        "aspect_ratio": ASPECT_RATIO,
+        "head_dim": HEAD_DIM,
+        "time_budget": time_budget,
+    }
+    _run_id = start_run(_config_snapshot, parent_run_id=os.environ.get("PARENT_RUN_ID"))
+
     print(f"Time budget: {time_budget}s")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
 
@@ -559,6 +588,8 @@ if __name__ == "__main__":
 
         # Fast fail: abort if loss is exploding or NaN
         if math.isnan(train_loss_f) or train_loss_f > 100:
+            end_run(_run_id, val_bpb=None, accepted=False,
+                    summary={"status": "failed"})
             print("FAIL")
             raise SystemExit(1)
 
@@ -580,6 +611,13 @@ if __name__ == "__main__":
             f"epoch: {epoch} | remaining: {remaining:.0f}s    ",
             end="", flush=True,
         )
+
+        if t_compiled is not None:
+            log_step(
+                _run_id, step, total_training_time,
+                train_loss_f, debiased_smooth_loss,
+                lrm, tok_per_sec, pct_done, epoch
+            )
 
         # GC management (Python's GC causes stalls)
         if step == 0:
@@ -620,6 +658,18 @@ if __name__ == "__main__":
 
     # Final summary
     peak_vram_mb = get_peak_memory_mb()
+
+    _summary = {
+        "val_bpb": val_bpb,
+        "training_seconds": total_training_time,
+        "total_tokens_m": total_tokens / 1e6,
+        "num_steps": step,
+        "num_params_m": num_params / 1e6,
+        "peak_vram_mb": peak_vram_mb,
+        "mfu_percent": steady_state_mfu,
+        "depth": DEPTH,
+    }
+    end_run(_run_id, val_bpb=val_bpb, accepted=None, summary=_summary)
 
     print("---")
     print(f"val_bpb:          {val_bpb:.6f}")

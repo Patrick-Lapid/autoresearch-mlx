@@ -17,6 +17,14 @@ dependencies = [
     "torch==2.9.1; sys_platform != 'darwin'",
 ]
 
+[project.optional-dependencies]
+dashboard = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "sse-starlette>=2.1",
+    "aiosqlite>=0.20",
+]
+
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },

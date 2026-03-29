@@ -27,3 +27,15 @@ results.tsv
 
 # Reference implementations (third-party, read-only)
 reference/
+
+# Dashboard runtime data
+dashboard/runs.db
+dashboard/runs.db-shm
+dashboard/runs.db-wal
+dashboard/frontend/node_modules/
+dashboard/frontend/.svelte-kit/
+dashboard/frontend/build/
+
+# Experiment logs
+reasoning.jsonl
+run.log
