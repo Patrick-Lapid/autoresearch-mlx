@@ -1,11 +1,11 @@
 """
-FastAPI server for the autoresearch dashboard.
-SSE streaming, REST API, reasoning.jsonl tailing, and static file hosting.
+Dashboard server. Reads experiments.jsonl, serves API + SSE + static files.
+Harness-agnostic: any tool that writes ExperimentRecord JSON lines works.
 """
 
 import asyncio
 import json
-import sqlite3
+import subprocess
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -13,20 +13,36 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
-from dashboard import tracker
-
-DB_PATH = tracker.DB_PATH
 REPO_ROOT = Path(__file__).parent.parent
-REASONING_JSONL = REPO_ROOT / "reasoning.jsonl"
+EXPERIMENTS_FILE = REPO_ROOT / "experiments.jsonl"
 
 app = FastAPI(title="autoresearch dashboard")
+
+# In-memory cache
+_records: list[dict] = []
+_subscribers: list[asyncio.Queue] = []
+
+
+def _load_records() -> list[dict]:
+    """Load all experiment records from the JSONL file."""
+    if not EXPERIMENTS_FILE.exists():
+        return []
+    records = []
+    for line in EXPERIMENTS_FILE.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
 
 
 @app.on_event("startup")
 async def startup():
-    tracker.init_db()
-    tracker.set_event_loop(asyncio.get_running_loop())
-    asyncio.create_task(_tail_reasoning_jsonl())
+    global _records
+    _records = _load_records()
+    asyncio.create_task(_tail_experiments())
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +51,8 @@ async def startup():
 
 @app.get("/stream")
 async def stream(request: Request):
-    q: asyncio.Queue = asyncio.Queue()
-    tracker.register_subscriber(q)
+    q: asyncio.Queue = asyncio.Queue(maxsize=256)
+    _subscribers.append(q)
 
     async def generator():
         try:
@@ -47,10 +63,12 @@ async def stream(request: Request):
                     event = await asyncio.wait_for(q.get(), timeout=15)
                     yield {"data": json.dumps(event)}
                 except asyncio.TimeoutError:
-                    # Send keepalive comment
                     yield {"comment": "keepalive"}
         finally:
-            tracker.unregister_subscriber(q)
+            try:
+                _subscribers.remove(q)
+            except ValueError:
+                pass
 
     return EventSourceResponse(generator())
 
@@ -59,87 +77,61 @@ async def stream(request: Request):
 # REST API
 # ---------------------------------------------------------------------------
 
-def _get_db():
-    con = sqlite3.connect(str(DB_PATH))
-    con.row_factory = sqlite3.Row
-    return con
+@app.get("/api/experiments")
+async def list_experiments():
+    return _records
 
 
-@app.get("/api/runs")
-async def list_runs():
-    con = _get_db()
-    rows = con.execute("SELECT * FROM runs ORDER BY iteration DESC").fetchall()
-    con.close()
-    return [dict(r) for r in rows]
+@app.get("/api/experiments/{exp_id}")
+async def get_experiment(exp_id: int):
+    for r in _records:
+        if r.get("id") == exp_id:
+            return r
+    return JSONResponse(status_code=404, content={"error": "not found"})
 
 
-@app.get("/api/runs/{run_id}")
-async def get_run(run_id: str):
-    con = _get_db()
-    run = con.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-    if run is None:
-        con.close()
-        return JSONResponse(status_code=404, content={"error": "run not found"})
-
-    steps = con.execute(
-        "SELECT * FROM steps WHERE run_id = ? ORDER BY step ASC", (run_id,)
-    ).fetchall()
-
-    notes = con.execute(
-        "SELECT * FROM agent_notes WHERE run_id = ? ORDER BY ts ASC", (run_id,)
-    ).fetchall()
-
-    con.close()
-    return {
-        "run": dict(run),
-        "steps": [dict(s) for s in steps],
-        "notes": [dict(n) for n in notes],
-    }
-
-
-@app.get("/api/notes")
-async def list_notes():
-    con = _get_db()
-    rows = con.execute("SELECT * FROM agent_notes ORDER BY ts ASC").fetchall()
-    con.close()
-    return [dict(r) for r in rows]
-
-
-@app.get("/api/runs/{run_id}/diff")
-async def get_diff(run_id: str):
-    con = _get_db()
-    row = con.execute(
-        "SELECT diff_patch FROM runs WHERE run_id = ?", (run_id,)
-    ).fetchone()
-    con.close()
-    if row is None:
-        return JSONResponse(status_code=404, content={"error": "run not found"})
-    return JSONResponse(content={"diff": row["diff_patch"] or ""})
+@app.get("/api/experiments/{exp_id}/diff")
+async def get_diff(exp_id: int):
+    """Return unified diff between parent_commit and commit for an experiment."""
+    for r in _records:
+        if r.get("id") == exp_id:
+            commit = r.get("commit", "")
+            parent = r.get("parent_commit", "")
+            if commit and parent:
+                try:
+                    result = subprocess.run(
+                        ["git", "diff", parent, commit, "--", "train.py"],
+                        capture_output=True, text=True, timeout=5,
+                        cwd=REPO_ROOT,
+                    )
+                    return {"diff": result.stdout or ""}
+                except Exception:
+                    return {"diff": ""}
+            return {"diff": ""}
+    return JSONResponse(status_code=404, content={"error": "not found"})
 
 
 # ---------------------------------------------------------------------------
-# reasoning.jsonl tailer
+# File tailer — watches experiments.jsonl for new records
 # ---------------------------------------------------------------------------
 
-async def _tail_reasoning_jsonl():
-    """Background task that tails reasoning.jsonl and pushes events to SSE."""
-    pos = 0
-    if REASONING_JSONL.exists():
-        pos = REASONING_JSONL.stat().st_size
+async def _tail_experiments():
+    """Tail experiments.jsonl for new records, push to SSE subscribers."""
+    pos = EXPERIMENTS_FILE.stat().st_size if EXPERIMENTS_FILE.exists() else 0
 
     while True:
         await asyncio.sleep(1.0)
-        if not REASONING_JSONL.exists():
+        if not EXPERIMENTS_FILE.exists():
             continue
 
-        size = REASONING_JSONL.stat().st_size
+        size = EXPERIMENTS_FILE.stat().st_size
         if size <= pos:
             if size < pos:
                 pos = 0  # file was truncated
             continue
 
         try:
-            with open(REASONING_JSONL, "r") as f:
+            with open(EXPERIMENTS_FILE) as f:
                 f.seek(pos)
                 new_data = f.read()
                 pos = f.tell()
@@ -149,26 +141,20 @@ async def _tail_reasoning_jsonl():
                 if not line:
                     continue
                 try:
-                    obj = json.loads(line)
+                    record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
 
-                event_type = obj.get("type")
-                run_id = obj.get("run_id", "")
-
-                if event_type == "agent_note":
-                    tracker.log_agent_note(
-                        run_id,
-                        intent=obj.get("intent", ""),
-                        hypothesis=obj.get("hypothesis", ""),
-                        raw=line,
-                    )
-                elif event_type == "accept_decision":
-                    accepted = obj.get("accepted", False)
-                    tracker.mark_accepted(run_id, accepted)
+                _records.append(record)
+                event = {"type": "new_experiment", **record}
+                for q in list(_subscribers):
+                    try:
+                        q.put_nowait(event)
+                    except asyncio.QueueFull:
+                        pass
 
         except Exception as e:
-            print(f"[server] error tailing reasoning.jsonl: {e}")
+            print(f"[server] error tailing experiments.jsonl: {e}")
 
 
 # ---------------------------------------------------------------------------

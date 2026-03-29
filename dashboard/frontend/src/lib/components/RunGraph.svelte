@@ -1,11 +1,10 @@
 <script lang="ts">
-	import type { Run, AgentNote, ParamChange } from '$lib/types';
+	import type { Experiment, ParamChange } from '$lib/types';
 	import { HYPERPARAM_KEYS } from '$lib/types';
 
-	let { runs = [], notes = [], onSelect = (_r: Run | null) => {} }: {
-		runs: Run[];
-		notes: AgentNote[];
-		onSelect?: (r: Run | null) => void;
+	let { experiments = [], onSelect = (_e: Experiment | null) => {} }: {
+		experiments: Experiment[];
+		onSelect?: (e: Experiment | null) => void;
 	} = $props();
 
 	// --- Container & sizing ---
@@ -31,93 +30,65 @@
 	let panOrigin = { x: 0, y: 0, tx: 0, ty: 0 };
 
 	// --- Interaction state ---
-	let selectedId: string | null = $state(null);
-	let hoveredId: string | null = $state(null);
+	let selectedId: number | null = $state(null);
+	let hoveredId: number | null = $state(null);
 
 	// --- Constants ---
 	const PAD = 80;
-	const R_ACC = 26;
-	const R_REJ = 15;
-	const R_RUN = 20;
+	const R_KEEP = 26;
+	const R_DISCARD = 15;
+	const R_CRASH = 12;
 
 	// --- Graph data ---
 	interface GNode {
-		id: string;
-		run: Run;
-		x: number;   // in graph space
+		id: number;
+		exp: Experiment;
+		x: number;
 		y: number;
 		r: number;
 		fill: string;
 		stroke: string;
-		note: AgentNote | null;
 		paramChanges: ParamChange[];
-		delta: { text: string; pct: string; cls: string } | null;
 	}
 
 	interface GEdge {
-		fromId: string;
-		toId: string;
+		fromId: number;
+		toId: number;
 		path: string;
-		accepted: boolean; // is the child accepted?
+		kept: boolean;
 	}
 
-	// Group notes by parent run_id
-	let notesByParent = $derived.by(() => {
-		const map = new Map<string, AgentNote[]>();
-		for (const n of notes) {
-			const arr = map.get(n.run_id) || [];
-			arr.push(n);
-			map.set(n.run_id, arr);
-		}
-		return map;
-	});
-
 	let graphNodes = $derived.by((): GNode[] => {
-		const withBpb = runs.filter(r => r.val_bpb != null);
-		const running = runs.filter(r => r.status === 'running' && r.val_bpb == null);
-		const all = [...withBpb, ...running];
-		if (all.length === 0) return [];
+		if (experiments.length === 0) return [];
 
-		const bpbs = withBpb.map(r => r.val_bpb!);
+		const bpbs = experiments.map(e => e.val_bpb);
 		const minBpb = Math.min(...bpbs);
 		const maxBpb = Math.max(...bpbs);
 		const bpbRange = maxBpb - minBpb || 0.1;
 		const bpbPad = bpbRange * 0.15;
 
-		const iters = all.map(r => r.iteration);
-		const minIter = Math.min(...iters);
-		const maxIter = Math.max(...iters);
-		const iterRange = maxIter - minIter || 1;
+		const ids = experiments.map(e => e.id);
+		const minId = Math.min(...ids);
+		const maxId = Math.max(...ids);
+		const idRange = maxId - minId || 1;
 
-		// Graph coordinate space (before transform)
-		const gw = Math.max(width * 1.2, (maxIter - minIter + 1) * 120);
+		const gw = Math.max(width * 1.2, (maxId - minId + 1) * 120);
 		const gh = Math.max(height * 0.9, 500);
 
-		return all.map(run => {
-			const x = PAD + ((run.iteration - minIter) / iterRange) * (gw - PAD * 2);
-			// Lower bpb at TOP (y=PAD), higher at BOTTOM (y=PAD+gh)
-			const rawBpb = run.val_bpb ?? maxBpb;
-			const y = PAD + ((rawBpb - (minBpb - bpbPad)) / (bpbRange + bpbPad * 2)) * (gh - PAD * 2);
+		return experiments.map(exp => {
+			const x = PAD + ((exp.id - minId) / idRange) * (gw - PAD * 2);
+			const y = PAD + ((exp.val_bpb - (minBpb - bpbPad)) / (bpbRange + bpbPad * 2)) * (gh - PAD * 2);
 
-			const isAcc = run.accepted === 1;
-			const isRunning = run.status === 'running' && run.val_bpb == null;
-			const r = isAcc ? R_ACC : isRunning ? R_RUN : R_REJ;
-
-			// Match note from parent's notes
-			let note: AgentNote | null = null;
-			if (run.parent_run_id) {
-				const pNotes = (notesByParent.get(run.parent_run_id) || []).sort((a, b) => a.ts - b.ts);
-				for (const n of pNotes) {
-					if (n.ts <= run.started_at + 5) note = n;
-				}
-			}
+			const isKeep = exp.status === 'keep';
+			const isCrash = exp.status === 'crash';
+			const r = isKeep ? R_KEEP : isCrash ? R_CRASH : R_DISCARD;
 
 			// Param diff vs parent
-			const parent = runs.find(p => p.run_id === run.parent_run_id);
+			const parent = experiments.find(p => p.commit === exp.parent_commit);
 			const paramChanges: ParamChange[] = [];
 			if (parent) {
 				for (const key of HYPERPARAM_KEYS) {
-					const cv = run[key];
+					const cv = exp[key];
 					const pv = parent[key];
 					if (cv != null && pv != null && String(cv) !== String(pv)) {
 						paramChanges.push({ key, from: pv as string | number, to: cv as string | number });
@@ -125,67 +96,56 @@
 				}
 			}
 
-			// Delta vs parent
-			let delta: GNode['delta'] = null;
-			if (run.val_bpb != null && parent?.val_bpb != null) {
-				const d = run.val_bpb - parent.val_bpb;
-				const pct = ((d / parent.val_bpb) * 100).toFixed(1);
-				delta = {
-					text: (d >= 0 ? '+' : '') + d.toFixed(4),
-					pct: (d >= 0 ? '+' : '') + pct + '%',
-					cls: d < 0 ? 'good' : 'bad',
-				};
-			}
-
 			return {
-				id: run.run_id,
-				run,
+				id: exp.id,
+				exp,
 				x, y, r,
-				fill: isAcc ? '#16A34A' : isRunning ? '#B45309' : 'rgba(220,38,38,0.12)',
-				stroke: isAcc ? '#16A34A' : isRunning ? '#B45309' : 'rgba(220,38,38,0.45)',
-				note,
+				fill: isKeep ? '#16A34A' : isCrash ? '#B45309' : 'rgba(220,38,38,0.12)',
+				stroke: isKeep ? '#16A34A' : isCrash ? '#B45309' : 'rgba(220,38,38,0.45)',
 				paramChanges,
-				delta,
 			};
 		});
 	});
 
 	let graphEdges = $derived.by((): GEdge[] => {
-		const nodeMap = new Map(graphNodes.map(n => [n.id, n]));
+		const nodeByCommit = new Map<string, GNode>();
+		for (const n of graphNodes) {
+			nodeByCommit.set(n.exp.commit, n);
+		}
 		return graphNodes
-			.filter(n => n.run.parent_run_id && nodeMap.has(n.run.parent_run_id))
+			.filter(n => n.exp.parent_commit && nodeByCommit.has(n.exp.parent_commit))
 			.map(n => {
-				const p = nodeMap.get(n.run.parent_run_id!)!;
+				const p = nodeByCommit.get(n.exp.parent_commit)!;
 				const dx = n.x - p.x;
 				return {
 					fromId: p.id,
 					toId: n.id,
 					path: `M${p.x},${p.y} C${p.x + dx * 0.5},${p.y} ${n.x - dx * 0.5},${n.y} ${n.x},${n.y}`,
-					accepted: n.run.accepted === 1,
+					kept: n.exp.status === 'keep',
 				};
 			});
 	});
 
 	// Lineage set for highlighting
-	let lineageSet = $derived.by((): Set<string> => {
+	let lineageSet = $derived.by((): Set<number> => {
 		const target = hoveredId ?? selectedId;
-		if (!target) return new Set();
-		const set = new Set<string>();
-		// Walk ancestors
-		let cur = runs.find(r => r.run_id === target);
+		if (target == null) return new Set();
+		const set = new Set<number>();
+		// Walk ancestors by commit chain
+		let cur = experiments.find(e => e.id === target);
 		while (cur) {
-			set.add(cur.run_id);
-			cur = cur.parent_run_id ? runs.find(r => r.run_id === cur!.parent_run_id) : undefined;
+			set.add(cur.id);
+			cur = cur.parent_commit ? experiments.find(e => e.commit === cur!.parent_commit) : undefined;
 		}
-		// Walk descendants (BFS)
-		const queue = [target];
+		// Walk descendants
+		const queue = [experiments.find(e => e.id === target)!];
 		while (queue.length) {
-			const id = queue.shift()!;
-			set.add(id);
-			for (const r of runs) {
-				if (r.parent_run_id === id && !set.has(r.run_id)) {
-					set.add(r.run_id);
-					queue.push(r.run_id);
+			const e = queue.shift()!;
+			set.add(e.id);
+			for (const child of experiments.filter(c => c.parent_commit === e.commit)) {
+				if (!set.has(child.id)) {
+					set.add(child.id);
+					queue.push(child);
 				}
 			}
 		}
@@ -194,7 +154,7 @@
 
 	let hasLineage = $derived(lineageSet.size > 0);
 
-	// --- Auto-fit on data change ---
+	// --- Auto-fit ---
 	let didFit = false;
 	$effect(() => {
 		if (graphNodes.length > 0 && width > 0 && height > 0 && !didFit) {
@@ -202,9 +162,8 @@
 			didFit = true;
 		}
 	});
-	// Reset fit flag when runs change
 	$effect(() => {
-		runs; // dependency
+		experiments;
 		didFit = false;
 	});
 
@@ -229,7 +188,6 @@
 		e.preventDefault();
 		const factor = e.deltaY > 0 ? 0.9 : 1.1;
 		const newSc = Math.max(0.1, Math.min(5, sc * factor));
-		// Zoom toward cursor
 		const rect = containerEl.getBoundingClientRect();
 		const cx = e.clientX - rect.left;
 		const cy = e.clientY - rect.top;
@@ -240,7 +198,6 @@
 
 	function onPointerDown(e: PointerEvent) {
 		if (e.button !== 0) return;
-		// Check if we're on a node (handled by node click)
 		if ((e.target as HTMLElement).closest('.graph-node')) return;
 		isPanning = true;
 		panOrigin = { x: e.clientX, y: e.clientY, tx, ty };
@@ -268,26 +225,21 @@
 	function onNodeClick(node: GNode, e: Event) {
 		e.stopPropagation();
 		selectedId = selectedId === node.id ? null : node.id;
-		onSelect(selectedId ? node.run : null);
+		onSelect(selectedId != null ? node.exp : null);
 	}
 
-	function onNodeEnter(node: GNode) {
-		hoveredId = node.id;
-	}
+	function onNodeEnter(node: GNode) { hoveredId = node.id; }
+	function onNodeLeave() { hoveredId = null; }
 
-	function onNodeLeave() {
-		hoveredId = null;
-	}
-
-	// Tooltip screen position
+	// Tooltip
 	let tooltipNode = $derived(graphNodes.find(n => n.id === hoveredId) ?? null);
 	let tooltipX = $derived(tooltipNode ? tooltipNode.x * sc + tx : 0);
 	let tooltipY = $derived(tooltipNode ? tooltipNode.y * sc + ty : 0);
 
-	function formatParam(key: string, val: string | number): string {
+	function fmtParam(key: string, val: string | number): string {
 		if (typeof val === 'number') {
 			if (key.endsWith('_lr')) return val.toPrecision(3);
-			if (key.endsWith('_ratio') || key === 'final_lr_frac') return val.toFixed(2);
+			if (key.endsWith('_ratio')) return val.toFixed(2);
 			return String(val);
 		}
 		return String(val);
@@ -305,22 +257,17 @@
 	aria-label="Experiment graph"
 >
 	<!-- svelte-ignore a11y_click_events_have_key_events -->
-	<svg
-		{width}
-		{height}
-		class="graph-svg"
-		onclick={onBgClick}
-	>
+	<svg {width} {height} class="graph-svg" onclick={onBgClick}>
 		<g transform="translate({tx},{ty}) scale({sc})">
 			<!-- Edges -->
-			{#each graphEdges as edge (edge.fromId + edge.toId)}
+			{#each graphEdges as edge (edge.fromId + '-' + edge.toId)}
 				{@const inLineage = hasLineage && lineageSet.has(edge.fromId) && lineageSet.has(edge.toId)}
 				<path
 					d={edge.path}
 					fill="none"
-					stroke={edge.accepted ? '#16A34A' : '#D1CEBF'}
-					stroke-width={edge.accepted ? 2.5 : 1.5}
-					stroke-dasharray={edge.accepted ? 'none' : '6,4'}
+					stroke={edge.kept ? '#16A34A' : '#D1CEBF'}
+					stroke-width={edge.kept ? 2.5 : 1.5}
+					stroke-dasharray={edge.kept ? 'none' : '6,4'}
 					opacity={hasLineage ? (inLineage ? 1 : 0.1) : 0.6}
 					class="graph-edge"
 				/>
@@ -330,11 +277,10 @@
 			{#each graphNodes as node (node.id)}
 				{@const inLineage = !hasLineage || lineageSet.has(node.id)}
 				{@const isSelected = selectedId === node.id}
-				{@const isHovered = hoveredId === node.id}
 				<!-- svelte-ignore a11y_click_events_have_key_events -->
 				<g
 					class="graph-node"
-					class:running={node.run.status === 'running'}
+					class:crash={node.exp.status === 'crash'}
 					transform="translate({node.x},{node.y})"
 					opacity={inLineage ? 1 : 0.15}
 					onclick={(e) => onNodeClick(node, e)}
@@ -343,40 +289,29 @@
 					role="button"
 					tabindex="0"
 				>
-					<!-- Selection ring -->
 					{#if isSelected}
-						<circle
-							r={node.r + 6}
-							fill="none"
-							stroke="#3B5BDB"
-							stroke-width="2.5"
-							opacity="0.5"
-						/>
+						<circle r={node.r + 6} fill="none" stroke="#3B5BDB" stroke-width="2.5" opacity="0.5" />
 					{/if}
-					<!-- Glow for accepted -->
-					{#if node.run.accepted === 1}
+					{#if node.exp.status === 'keep'}
 						<circle r={node.r + 3} fill={node.fill} opacity="0.15" />
 					{/if}
-					<!-- Main circle -->
 					<circle
 						r={node.r}
-						fill={node.run.accepted === 1 ? node.fill : node.fill}
+						fill={node.fill}
 						stroke={node.stroke}
-						stroke-width={node.run.accepted === 1 ? 3 : 1.5}
+						stroke-width={node.exp.status === 'keep' ? 3 : 1.5}
 					/>
-					<!-- Iteration label -->
 					<text
 						y="1"
 						text-anchor="middle"
 						dominant-baseline="central"
 						class="node-label"
-						fill={node.run.accepted === 1 ? 'white' : '#57534E'}
-						font-size={node.run.accepted === 1 ? '11' : '9'}
+						fill={node.exp.status === 'keep' ? 'white' : '#57534E'}
+						font-size={node.exp.status === 'keep' ? '11' : '9'}
 						font-weight="700"
 					>
-						{node.run.iteration}
+						{node.exp.id}
 					</text>
-					<!-- BPB label below -->
 					<text
 						y={node.r + 14}
 						text-anchor="middle"
@@ -384,55 +319,47 @@
 						fill="#78716C"
 						font-size="10"
 					>
-						{node.run.val_bpb?.toFixed(3) ?? '...'}
+						{node.exp.val_bpb.toFixed(3)}
 					</text>
 				</g>
 			{/each}
 		</g>
 
-		<!-- Axis hints (fixed position, not affected by transform) -->
+		<!-- Axis hints -->
 		<text x="12" y={height / 2} fill="#A8A29E" font-size="10" transform="rotate(-90, 12, {height / 2})" text-anchor="middle" class="axis-label">
 			val_bpb (lower = better)
 		</text>
 		<text x={width / 2} y={height - 8} fill="#A8A29E" font-size="10" text-anchor="middle" class="axis-label">
-			iteration
+			experiment
 		</text>
 	</svg>
 
 	<!-- Hover tooltip -->
 	{#if tooltipNode && hoveredId !== selectedId}
-		<div
-			class="tooltip"
-			style="left: {tooltipX}px; top: {tooltipY - tooltipNode.r * sc - 12}px;"
-		>
+		<div class="tooltip" style="left: {tooltipX}px; top: {tooltipY - tooltipNode.r * sc - 12}px;">
 			<div class="tt-header">
-				<span class="tt-iter">#{tooltipNode.run.iteration}</span>
-				<span class="tt-id">{tooltipNode.run.run_id}</span>
-				{#if tooltipNode.run.accepted === 1}
-					<span class="tt-badge acc">accepted</span>
-				{:else if tooltipNode.run.accepted === 0}
-					<span class="tt-badge rej">rejected</span>
-				{:else}
-					<span class="tt-badge run">running</span>
+				<span class="tt-iter">#{tooltipNode.exp.id}</span>
+				<span class="tt-id">{tooltipNode.exp.commit}</span>
+				<span class="tt-badge {tooltipNode.exp.status}">{tooltipNode.exp.status}</span>
+			</div>
+			<div class="tt-bpb">
+				{tooltipNode.exp.val_bpb.toFixed(6)}
+				{#if tooltipNode.exp.delta !== 0}
+					<span class="tt-delta" class:good={tooltipNode.exp.delta < 0} class:bad={tooltipNode.exp.delta > 0}>
+						{tooltipNode.exp.delta >= 0 ? '+' : ''}{tooltipNode.exp.delta.toFixed(4)}
+					</span>
 				{/if}
 			</div>
-			{#if tooltipNode.run.val_bpb != null}
-				<div class="tt-bpb">
-					{tooltipNode.run.val_bpb.toFixed(6)}
-					{#if tooltipNode.delta}
-						<span class="tt-delta {tooltipNode.delta.cls}">{tooltipNode.delta.text} ({tooltipNode.delta.pct})</span>
-					{/if}
-				</div>
-			{/if}
-			{#if tooltipNode.note}
-				<div class="tt-intent">{tooltipNode.note.intent}</div>
-			{/if}
+			<div class="tt-desc">{tooltipNode.exp.description}</div>
 			{#if tooltipNode.paramChanges.length > 0}
 				<div class="tt-params">
 					{#each tooltipNode.paramChanges as ch}
-						<span class="tt-pill">{ch.key}: {formatParam(ch.key, ch.from)} → {formatParam(ch.key, ch.to)}</span>
+						<span class="tt-pill">{ch.key}: {fmtParam(ch.key, ch.from)} → {fmtParam(ch.key, ch.to)}</span>
 					{/each}
 				</div>
+			{/if}
+			{#if tooltipNode.exp.still_improving}
+				<div class="tt-flag">still improving at end of budget</div>
 			{/if}
 		</div>
 	{/if}
@@ -461,53 +388,15 @@
 		border-radius: var(--radius);
 		border: 1px solid var(--border);
 	}
-	.graph-wrap:active {
-		cursor: grabbing;
-	}
-
-	.graph-svg {
-		display: block;
-	}
-
-	.graph-edge {
-		pointer-events: none;
-		transition: opacity 0.2s ease;
-	}
-
-	.graph-node {
-		cursor: pointer;
-		transition: opacity 0.2s ease;
-	}
-	.graph-node:hover circle {
-		filter: brightness(1.1);
-	}
-
-	.graph-node.running circle:first-of-type {
-		animation: pulse 2s ease-in-out infinite;
-	}
-	@keyframes pulse {
-		0%, 100% { opacity: 1; }
-		50% { opacity: 0.4; }
-	}
-
-	.node-label {
-		font-family: var(--font-mono);
-		pointer-events: none;
-		user-select: none;
-	}
-
-	.node-bpb {
-		font-family: var(--font-mono);
-		pointer-events: none;
-		user-select: none;
-	}
-
-	.axis-label {
-		font-family: var(--font-body);
-		pointer-events: none;
-		user-select: none;
-		letter-spacing: 0.03em;
-	}
+	.graph-wrap:active { cursor: grabbing; }
+	.graph-svg { display: block; }
+	.graph-edge { pointer-events: none; transition: opacity 0.2s ease; }
+	.graph-node { cursor: pointer; transition: opacity 0.2s ease; }
+	.graph-node:hover circle { filter: brightness(1.1); }
+	.graph-node.crash circle:first-of-type { animation: pulse 2s ease-in-out infinite; }
+	@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+	.node-label, .node-bpb { font-family: var(--font-mono); pointer-events: none; user-select: none; }
+	.axis-label { font-family: var(--font-body); pointer-events: none; user-select: none; letter-spacing: 0.03em; }
 
 	/* Tooltip */
 	.tooltip {
@@ -521,99 +410,35 @@
 		font-size: 0.78rem;
 		pointer-events: none;
 		z-index: 50;
-		max-width: 320px;
+		max-width: 340px;
 		box-shadow: 0 8px 24px rgba(0,0,0,0.3);
-		white-space: nowrap;
 	}
-
-	.tt-header {
-		display: flex;
-		align-items: center;
-		gap: 0.4rem;
-		margin-bottom: 0.25rem;
-	}
-	.tt-iter {
-		font-family: var(--font-mono);
-		font-weight: 700;
-		font-size: 0.85rem;
-	}
-	.tt-id {
-		font-family: var(--font-mono);
-		font-size: 0.7rem;
-		opacity: 0.5;
-	}
+	.tt-header { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.25rem; }
+	.tt-iter { font-family: var(--font-mono); font-weight: 700; font-size: 0.85rem; }
+	.tt-id { font-family: var(--font-mono); font-size: 0.7rem; opacity: 0.5; }
 	.tt-badge {
-		font-size: 0.6rem;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		padding: 0.1rem 0.35rem;
-		border-radius: 4px;
-		margin-left: auto;
+		font-size: 0.6rem; font-weight: 600; text-transform: uppercase;
+		letter-spacing: 0.04em; padding: 0.1rem 0.35rem; border-radius: 4px; margin-left: auto;
 	}
-	.tt-badge.acc { background: rgba(22,163,74,0.2); color: #4ADE80; }
-	.tt-badge.rej { background: rgba(220,38,38,0.2); color: #FCA5A5; }
-	.tt-badge.run { background: rgba(180,83,9,0.2); color: #FCD34D; }
-
-	.tt-bpb {
-		font-family: var(--font-mono);
-		font-size: 0.82rem;
-		font-weight: 600;
-		margin-bottom: 0.25rem;
-	}
-	.tt-delta {
-		font-size: 0.72rem;
-		font-weight: 500;
-		margin-left: 0.35rem;
-	}
+	.tt-badge.keep { background: rgba(22,163,74,0.2); color: #4ADE80; }
+	.tt-badge.discard { background: rgba(220,38,38,0.2); color: #FCA5A5; }
+	.tt-badge.crash { background: rgba(180,83,9,0.2); color: #FCD34D; }
+	.tt-bpb { font-family: var(--font-mono); font-size: 0.82rem; font-weight: 600; margin-bottom: 0.25rem; }
+	.tt-delta { font-size: 0.72rem; font-weight: 500; margin-left: 0.35rem; }
 	.tt-delta.good { color: #4ADE80; }
 	.tt-delta.bad { color: #FCA5A5; }
-
-	.tt-intent {
-		font-size: 0.75rem;
-		color: #D6D3D1;
-		line-height: 1.35;
-		white-space: normal;
-		margin-bottom: 0.2rem;
-	}
-
-	.tt-params {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.25rem;
-		margin-top: 0.25rem;
-	}
-	.tt-pill {
-		font-family: var(--font-mono);
-		font-size: 0.65rem;
-		background: rgba(255,255,255,0.08);
-		padding: 0.1rem 0.4rem;
-		border-radius: 999px;
-		color: #A8A29E;
-	}
+	.tt-desc { font-size: 0.75rem; color: #D6D3D1; line-height: 1.35; white-space: normal; margin-bottom: 0.2rem; }
+	.tt-params { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.25rem; }
+	.tt-pill { font-family: var(--font-mono); font-size: 0.65rem; background: rgba(255,255,255,0.08); padding: 0.1rem 0.4rem; border-radius: 999px; color: #A8A29E; }
+	.tt-flag { font-size: 0.68rem; color: #FCD34D; margin-top: 0.25rem; font-style: italic; }
 
 	/* Fit button */
 	.fit-btn {
-		position: absolute;
-		bottom: 12px;
-		right: 12px;
-		background: var(--bg-card);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-sm);
-		width: 32px;
-		height: 32px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		cursor: pointer;
-		color: var(--text-dim);
-		box-shadow: var(--shadow-sm);
-		transition: all 0.15s ease;
-		z-index: 10;
+		position: absolute; bottom: 12px; right: 12px;
+		background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-sm);
+		width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+		cursor: pointer; color: var(--text-dim); box-shadow: var(--shadow-sm);
+		transition: all 0.15s ease; z-index: 10;
 	}
-	.fit-btn:hover {
-		color: var(--text);
-		border-color: var(--border-strong);
-		box-shadow: var(--shadow-md);
-	}
+	.fit-btn:hover { color: var(--text); border-color: var(--border-strong); box-shadow: var(--shadow-md); }
 </style>
