@@ -63,6 +63,32 @@ export interface RunDetail {
 	notes: AgentNote[];
 }
 
+export const HYPERPARAM_KEYS = [
+	'depth', 'total_batch_size', 'device_batch_size', 'embedding_lr', 'unembedding_lr',
+	'matrix_lr', 'scalar_lr', 'weight_decay', 'warmup_ratio', 'warmdown_ratio',
+	'final_lr_frac', 'window_pattern', 'aspect_ratio', 'head_dim', 'time_budget',
+] as const;
+
+export type HyperparamKey = (typeof HYPERPARAM_KEYS)[number];
+
+export interface ParamChange {
+	key: string;
+	from: string | number;
+	to: string | number;
+}
+
+export interface PlateauChild {
+	run: Run;
+	note: AgentNote | null;
+	paramChanges: ParamChange[];
+}
+
+export interface Plateau {
+	parent: Run;
+	children: PlateauChild[];
+	noteForParent: AgentNote | null;
+}
+
 export type SSEEvent =
 	| { type: 'run_start'; run_id: string; iteration: number; parent_run_id: string | null; config: Record<string, unknown> }
 	| StepEvent

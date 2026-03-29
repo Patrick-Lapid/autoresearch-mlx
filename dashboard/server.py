@@ -97,6 +97,14 @@ async def get_run(run_id: str):
     }
 
 
+@app.get("/api/notes")
+async def list_notes():
+    con = _get_db()
+    rows = con.execute("SELECT * FROM agent_notes ORDER BY ts ASC").fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
 @app.get("/api/runs/{run_id}/diff")
 async def get_diff(run_id: str):
     con = _get_db()

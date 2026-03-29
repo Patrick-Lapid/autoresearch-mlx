@@ -21,7 +21,7 @@
 				<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M2 2v4h4M2 8a6 6 0 1 1 1.76 4.24"/>
 				</svg>
-				History
+				Decisions
 			</a>
 		</div>
 	</div>

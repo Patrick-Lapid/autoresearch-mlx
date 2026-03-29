@@ -1,4 +1,4 @@
-import type { Run, RunDetail } from './types';
+import type { Run, RunDetail, AgentNote } from './types';
 
 export async function fetchRuns(): Promise<Run[]> {
 	const res = await fetch('/api/runs');
@@ -7,6 +7,12 @@ export async function fetchRuns(): Promise<Run[]> {
 
 export async function fetchRun(runId: string): Promise<RunDetail> {
 	const res = await fetch(`/api/runs/${runId}`);
+	return res.json();
+}
+
+export async function fetchNotes(): Promise<AgentNote[]> {
+	const res = await fetch('/api/notes');
+	if (!res.ok) return [];
 	return res.json();
 }
 
