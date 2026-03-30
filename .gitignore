@@ -29,13 +29,11 @@ results.tsv
 reference/
 
 # Dashboard runtime data
-dashboard/runs.db
-dashboard/runs.db-shm
-dashboard/runs.db-wal
 dashboard/frontend/node_modules/
 dashboard/frontend/.svelte-kit/
 dashboard/frontend/build/
 
-# Experiment logs
+# Experiment logs and records
 reasoning.jsonl
+experiments.jsonl
 run.log
